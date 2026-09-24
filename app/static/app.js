@@ -14,6 +14,7 @@ const api = async (url, opts = {}) => {
 const state = {
   jobId: null,
   strength: "medium",
+  embedMode: "manual",    // manual | auto（嵌入面板）
   detectMode: "normal",    // normal | orient（独立检测）
   originalUrl: null,
   watermarkedUrl: null,
@@ -23,7 +24,28 @@ const state = {
   report: null,            // 最近生成的归档报告
 };
 
-/* ---------------- 嵌入 ---------------- */
+/* ---------------- 嵌入：手动 / 自动模式 ---------------- */
+
+$("#embed-mode-seg").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-value]");
+  if (!btn) return;
+  state.embedMode = btn.dataset.value;
+  document.querySelectorAll("#embed-mode-seg button").forEach((b) =>
+    b.classList.toggle("on", b === btn)
+  );
+  const isAuto = state.embedMode === "auto";
+  $("#manual-strength-field").classList.toggle("hidden", isAuto);
+  $("#auto-strength-field").classList.toggle("hidden", !isAuto);
+  $("#btn-embed").textContent = isAuto ? "自动选强度并嵌入" : "嵌入水印";
+});
+
+$("#auto-jpeg-q").addEventListener("input", (e) =>
+  $("#auto-jpeg-val").textContent = e.target.value);
+$("#auto-crop-f").addEventListener("input", (e) =>
+  $("#auto-crop-val").textContent = `${e.target.value}%`);
+$("#auto-psnr").addEventListener("input", (e) =>
+  $("#auto-psnr-val").textContent = `${e.target.value} dB`);
+
 
 $("#strength-seg").addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-value]");
@@ -56,6 +78,10 @@ $("#btn-embed").addEventListener("click", async () => {
   if (!file) return fail(status, "请先选择一张图片。");
   if (!text) return fail(status, "请输入水印文本。");
 
+  if (state.embedMode === "auto") {
+    return runAutoEmbed(file, text, status);
+  }
+
   const fd = new FormData();
   fd.append("image", file);
   fd.append("text", text);
@@ -64,36 +90,145 @@ $("#btn-embed").addEventListener("click", async () => {
   busy(status, "正在执行分块 DCT 嵌入…");
   try {
     const r = await api("/api/embed", { method: "POST", body: fd });
-    state.jobId = r.job_id;
-    state.watermarkedUrl = `/api/jobs/${r.job_id}/watermarked?t=${Date.now()}`;
-    state.targetUrl = null;
-    state.markedUrl = null;
-    state.detections = [];
-    state.report = null;
-    renderDetectList();
-    resetReportBox();
-    resetMatrixPanel();
-    showImage("watermarked", state.watermarkedUrl);
-    $("#img-target").removeAttribute("src");
-    $("#img-marked").removeAttribute("src");
-
-    $("#m-psnr").textContent = `${r.psnr_db} dB`;
-    $("#m-tiles").textContent = `${r.full_tiles} 个`;
-    $("#m-votes").textContent = `≈ ${r.votes_per_bit} 票/比特`;
-    $("#m-cap").textContent = `${r.payload_bytes} / ${r.capacity_bytes} 字节`;
-    $("#m-size").textContent = `${r.width} × ${r.height}`;
-    $("#embed-meta").classList.remove("hidden");
+    applyEmbeddedJob(r, "手动选档：" + strengthLabel(r.strength));
+    $("#auto-result").classList.add("hidden");
     ok(status, "嵌入成功，请查看「含水印图」标签。");
-
-    $("#panel-attack").classList.remove("disabled");
-    $("#panel-matrix").classList.remove("disabled");
-    $("#btn-detect-attacked").disabled = false;
-    document.querySelector('.step[data-step="2"]').classList.add("active");
-    switchTab("watermarked");
   } catch (err) {
     fail(status, err.message);
   }
 });
+
+async function runAutoEmbed(file, text, status) {
+  const fd = new FormData();
+  fd.append("image", file);
+  fd.append("text", text);
+  fd.append("jpeg_quality", $("#auto-jpeg-q").value);
+  fd.append("crop_fraction", parseInt($("#auto-crop-f").value, 10) / 100);
+  fd.append("min_psnr_db", $("#auto-psnr").value);
+
+  busy(status, "正在按 低 → 中 → 高 逐档嵌入并执行「先裁切后压缩 + 盲检」…");
+  let r;
+  try {
+    r = await api("/api/embed-auto", { method: "POST", body: fd });
+  } catch (err) {
+    $("#auto-result").classList.add("hidden");
+    return fail(status, err.message);
+  }
+
+  renderAutoTiers(r);
+  if (!r.passed) {
+    // 三档均未通过：服务端未创建任务
+    $("#embed-meta").classList.add("hidden");
+    $("#panel-attack").classList.add("disabled");
+    $("#panel-matrix").classList.add("disabled");
+    $("#btn-detect-attacked").disabled = true;
+    fail(status, "低 / 中 / 高三档均未同时满足「恢复文本逐字一致」与「PSNR 达标」，未创建任务；请放宽攻击参数或降低 PSNR 下限后重试。");
+    return;
+  }
+
+  applyEmbeddedJob(r, `自动选档：${strengthLabel(r.selected_strength)}（低 → 中 → 高首个通过档）`);
+  ok(status, `自动选档完成：选用「${strengthLabel(r.selected_strength)}」强度，已保存任务，可下载与继续攻击 / 检测。`);
+}
+
+function applyEmbeddedJob(r, strengthNote) {
+  state.jobId = r.job_id;
+  state.watermarkedUrl = `/api/jobs/${r.job_id}/watermarked?t=${Date.now()}`;
+  state.targetUrl = null;
+  state.markedUrl = null;
+  state.detections = [];
+  state.report = null;
+  renderDetectList();
+  resetReportBox();
+  resetMatrixPanel();
+  showImage("watermarked", state.watermarkedUrl);
+  $("#img-target").removeAttribute("src");
+  $("#img-marked").removeAttribute("src");
+
+  $("#m-strength").textContent = strengthNote;
+  $("#m-psnr").textContent = `${r.psnr_db} dB`;
+  $("#m-tiles").textContent = `${r.full_tiles} 个`;
+  $("#m-votes").textContent = `≈ ${r.votes_per_bit} 票/比特`;
+  $("#m-cap").textContent = `${r.payload_bytes} / ${r.capacity_bytes} 字节`;
+  $("#m-size").textContent = `${r.width} × ${r.height}`;
+  $("#embed-meta").classList.remove("hidden");
+
+  $("#panel-attack").classList.remove("disabled");
+  $("#panel-matrix").classList.remove("disabled");
+  $("#btn-detect-attacked").disabled = false;
+  document.querySelector('.step[data-step="2"]').classList.add("active");
+  switchTab("watermarked");
+}
+
+const STRENGTH_TEXT = { low: "低", medium: "中", high: "高" };
+function strengthLabel(s) {
+  return STRENGTH_TEXT[s] ? `${STRENGTH_TEXT[s]}（${s}）` : String(s);
+}
+
+function renderAutoTiers(r) {
+  const box = $("#auto-result");
+  box.classList.remove("hidden");
+  const req = r.request || {};
+  const attackDesc =
+    `JPEG Q${req.jpeg_quality} · 中心裁切 ${Math.round((req.crop_fraction ?? 0) * 100)}%` +
+    ` · 最低 PSNR ${req.min_psnr_db} dB`;
+
+  const summary = $("#auto-summary");
+  if (r.passed) {
+    summary.className = "auto-summary ok";
+    summary.innerHTML =
+      `攻击模拟 <b>${escapeHtml(attackDesc)}</b> · ` +
+      `选用档位 <b class="auto-pick">${escapeHtml(strengthLabel(r.selected_strength))}</b>` +
+      `（该档 PSNR ${r.selected_tier.psnr_db} dB，恢复文本与原文逐字一致）`;
+  } else {
+    summary.className = "auto-summary fail";
+    summary.innerHTML =
+      `攻击模拟 <b>${escapeHtml(attackDesc)}</b> · ` +
+      `<b>三档均未通过，未创建任务</b>（逐档实测如下）`;
+  }
+
+  const head =
+    `<thead><tr>
+       <th>档位</th><th>嵌入 PSNR</th><th>PSNR 达标</th>
+       <th>盲检恢复</th><th>文本一致</th><th>置信度</th><th>同步峰 / 一致率</th>
+     </tr></thead>`;
+  const rows = r.tiers.map((t) => {
+    const chosen = r.passed && t.strength === r.selected_strength;
+    const m = t.metrics || {};
+    const recover = t.detected
+      ? `<code>${escapeHtml(t.text || "（空）")}</code>`
+      : `<span class="muted" title="${escapeHtml(t.reason || "")}">未恢复</span>`;
+    return `<tr class="${chosen ? "chosen" : ""}" title="${escapeHtml(autoTierTitle(t))}">
+      <td><b>${escapeHtml(t.strength_label)}（${t.strength}）</b>${chosen ? ' <span class="auto-pick-badge">★ 选用</span>' : ""}</td>
+      <td>${t.psnr_db} dB</td>
+      <td>${t.psnr_ok ? "✔" : "✘"}</td>
+      <td class="auto-text">${recover}</td>
+      <td>${t.text_match ? "✔ 逐字一致" : "✘"}</td>
+      <td>${t.detected ? `${m.confidence ?? "—"}%` : "—"}</td>
+      <td>${t.detected
+        ? `${m.sync_score ?? "—"} / ${((m.sync_agreement ?? 0) * 100).toFixed(1)}%`
+        : "—"}</td>
+    </tr>`;
+  }).join("");
+  $("#auto-table").innerHTML = head + `<tbody>${rows}</tbody>`;
+}
+
+function autoTierTitle(t) {
+  const m = t.metrics || {};
+  const lines = [
+    `${t.strength_label}档（${t.strength}）`,
+    `嵌入 PSNR：${t.psnr_db} dB（${t.psnr_ok ? "达标" : "低于下限"}）`,
+  ];
+  if (t.detected) {
+    lines.push(`恢复文本：${t.text || "（空）"}`);
+    lines.push(`置信度 ${m.confidence}% · 同步峰 ${m.sync_score} · 一致率 ${(m.sync_agreement * 100).toFixed(1)}%`);
+    lines.push(`瓦片 ${m.tiles_y}×${m.tiles_x} · 同步块 ${m.sync_blocks} · 载荷块 ${m.payload_blocks} · 票/bit ${m.votes_per_bit}`);
+  } else {
+    lines.push(`未恢复：${t.reason || "—"}`);
+  }
+  lines.push(`攻击后尺寸 ${t.width}×${t.height}px（吸附保留 ${Math.round(t.snapped_fraction_w * 100)}%×${Math.round(t.snapped_fraction_h * 100)}%）`);
+  return lines.join("\n");
+}
+
 
 $("#btn-download-wm").addEventListener("click", () => {
   if (state.jobId) window.open(`/api/jobs/${state.jobId}/watermarked`, "_blank");

@@ -41,6 +41,14 @@
       </label>
 
       <div class="field">
+        <span>选强度模式</span>
+        <div class="seg" id="embed-mode-seg">
+          <button type="button" data-value="manual" class="on">手动选强度</button>
+          <button type="button" data-value="auto">自动选强度</button>
+        </div>
+      </div>
+
+      <div class="field" id="manual-strength-field">
         <span>嵌入强度</span>
         <div class="seg" id="strength-seg">
           <button type="button" data-value="low">低（更隐蔽）</button>
@@ -49,12 +57,42 @@
         </div>
       </div>
 
+      <div id="auto-strength-field" class="auto-fields hidden">
+        <div class="field">
+          <span>攻击模拟 · JPEG 质量：<b id="auto-jpeg-val">50</b></span>
+          <input type="range" id="auto-jpeg-q" min="20" max="100" step="1" value="50" />
+          <div class="range-labels"><span>20（狠）</span><span>60</span><span>100（轻）</span></div>
+        </div>
+        <div class="field">
+          <span>攻击模拟 · 中心裁切保留：<b id="auto-crop-val">75%</b></span>
+          <input type="range" id="auto-crop-f" min="30" max="100" step="5" value="75" />
+          <div class="range-labels"><span>30%</span><span>75%</span><span>100%</span></div>
+          <small class="muted">每档都从同一原图独立执行「先裁切、后 JPEG」并盲检；裁切吸附 8px 网格。</small>
+        </div>
+        <div class="field">
+          <span>嵌入图最低 PSNR：<b id="auto-psnr-val">30 dB</b></span>
+          <input type="range" id="auto-psnr" min="20" max="60" step="1" value="30" />
+          <div class="range-labels"><span>20 dB</span><span>40 dB</span><span>60 dB</span></div>
+          <small class="muted">按「低 → 中 → 高」逐档试嵌，仅选首个恢复文本逐字一致且 PSNR 达标档位；三档均不过则不创建任务。</small>
+        </div>
+      </div>
+
       <button class="primary" id="btn-embed">嵌入水印</button>
       <div class="status" id="embed-status"></div>
+
+      <div id="auto-result" class="auto-box hidden">
+        <div id="auto-summary" class="auto-summary"></div>
+        <table class="auto-table" id="auto-table"></table>
+        <small class="muted">
+          每档均为服务端从同一原图实测：对该档含水印图先中心裁切后 JPEG 压缩，再调用盲检测器；
+          PSNR 为该档含水印图相对原图的实测亮度 PSNR。
+        </small>
+      </div>
 
       <div id="embed-meta" class="meta hidden">
         <h3>嵌入结果</h3>
         <dl>
+          <dt>档位 / 模式</dt><dd id="m-strength">—</dd>
           <dt>PSNR</dt><dd id="m-psnr">—</dd>
           <dt>同步瓦片</dt><dd id="m-tiles">—</dd>
           <dt>每比特票数</dt><dd id="m-votes">—</dd>

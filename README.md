@@ -3,7 +3,8 @@
 一个用于研究/演示**鲁棒数字图像水印**的 Web 实验平台。上传图片与一段短文本水印，系统在
 **分块 DCT（离散余弦变换）频域**中把水印与同步标记平铺嵌入；嵌入后的图片即使经过
 **JPEG 重压缩**与**中心裁切**，检测端仍能自动定位同步网格、通过重复块多数表决恢复文本，
-并给出置信度与**疑似失真区域标注图**。
+并给出置信度与**疑似失真区域标注图**。嵌入支持**手动选强度**与**自动选强度**
+（给定 JPEG 质量 / 裁切比例 / 最低 PSNR，按低→中→高逐档实测，选首个通过档）。
 
 - 后端：Python 3.11 · FastAPI · OpenCV(headless) · Pillow · NumPy
 - 前端：原生 HTML / CSS / JavaScript（无构建、无框架）
@@ -13,7 +14,9 @@
 
 ## 一、快速启动
 
-### 方式 A：docker compose（推荐）
+### 方式 A：docker compose（推荐，单条命令一键启动）
+
+只需一条命令（自动构建镜像、启动服务并在 `8000` 端口提供服务）：
 
 ```bash
 docker compose up -d --build
@@ -23,8 +26,14 @@ docker compose up -d --build
 
 > **http://localhost:8000**
 
+无需任何额外配置：任务数据默认持久化到 Docker 命名卷 `wm-data`
+（容器内路径 `/data/wmbench`，可通过环境变量 `WM_DATA_DIR` /
+`WM_MAX_JOBS` 调整，见[第五节配置项](#五配置项环境变量)）；
+不依赖外部数据库或额外服务，镜像内已包含 OpenCV headless 所需系统库。
+
 嵌入水印后，在首页左栏「② 施加攻击」下方即可进入「**▦ 鲁棒性矩阵评测**」
 （同一端口、同一容器，无需额外服务或端口；compose 配置保持不变）。
+「① 嵌入水印」面板内可直接切换 **手动选强度 / 自动选强度** 两种模式。
 
 停止 / 清理：
 
@@ -52,8 +61,19 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
 页面按 **① 嵌入 → ② 施加攻击 → ③ 检测 / 标注** 三步组织：
 
 1. **嵌入水印**：选择本地图片（最短边 ≥ 128px，建议 ≥ 512px 的自然照片），
-   输入短文本（≤ 45 字节，约 45 个 ASCII 字符或 15 个汉字），选择强度后点击「嵌入水印」。
-   页面显示 PSNR、同步瓦片数、每比特票数等指标，并可**下载无损含水印 PNG**。
+   输入短文本（≤ 45 字节，约 45 个 ASCII 字符或 15 个汉字），选择
+   **手动选强度** 或 **自动选强度** 模式后点击嵌入：
+   - **手动选强度（默认，行为不变）**：直接指定低 / 中 / 高档，立即嵌入。
+     页面显示 PSNR、同步瓦片数、每比特票数等指标，并可**下载无损含水印 PNG**。
+   - **自动选强度**：另指定一次攻击模拟参数——**JPEG 质量（20–100）**、
+     **中心裁切保留比例（30%–100%，吸附 8px 网格）** 与**嵌入图最低
+     PSNR（20–60 dB）**。服务端按 **低 → 中 → 高** 顺序从**同一张原图**
+     分别嵌入，每档都独立执行「**先中心裁切、后 JPEG 压缩**」并调用与③完全
+     相同的现有盲检；**仅当恢复文本与原文逐字一致且该档嵌入图 PSNR ≥ 下限**
+     时该档通过，选取**首个通过档**保存为任务。页面展示所选档位与三档的
+     PSNR、PSNR 是否达标、盲检恢复文本、是否逐字一致、置信度与同步指标。
+     **三档均未通过时不创建任务、不写任何文件**，页面给出逐档实测结果与
+     失败原因，可放宽攻击参数或降低 PSNR 下限后重试。
 2. **施加攻击**：拖动滑块选择 JPEG 质量（20–100）与中心裁切保留比例（30%–100%，
    裁切边界吸附到 8px DCT 网格），可多次叠加。点击「检测受攻击图片」。
 3. **检测 / 标注**：
@@ -89,8 +109,36 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
   绿格=恢复一致，黄格=检测到但文本不一致，红格=未恢复/失败。
 
 对应接口：`POST /api/jobs/{job_id}/robustness-matrix`
-（请求体 `{"jpeg_qualities": [90,50,30], "crop_fractions": [1.0,0.75,0.5]}`），
+（请求体 `{"jpeg_qualities": [90,50,30], "crop_fractions": [0.75,0.5]}`），
 访问地址即首页所在服务，无需额外端口或容器。
+
+### 自动选强度嵌入（嵌入面板内）
+
+入口：首页 **http://localhost:8000** → 左栏「① 嵌入水印」→ 模式切到
+**「自动选强度」**。参数与判定：
+
+- **攻击模拟参数**：JPEG 质量 **20–100**（整数）、中心裁切保留比例
+  **30%–100%**（吸附 8px 网格，与攻击面板同一实现）、嵌入图最低
+  PSNR **20–60 dB**。
+- **逐档评测**：服务端按 **低（low）→ 中（medium）→ 高（high）** 顺序，
+  三档都从**同一份原图**各自重新嵌入；每档对该档含水印图执行
+  **先中心裁切、后 JPEG 压缩**，再调用与③完全相同的现有盲检测器
+  （64 相移同步搜索 + 多数表决 + 魔数/校验和）。
+- **通过条件（两条同时满足）**：① 盲检恢复文本与用户原文**逐字一致**；
+  ② 该档**嵌入图 PSNR（亮度 Y 通道，口径与手动嵌入一致）≥ 最低 PSNR**。
+  取按序**首个**通过档——强度越低越不可见（PSNR 越高），因此优先低档。
+- **通过**：沿用现有任务保存与下载流程（`original.png` /
+  `watermarked.png` / `meta.json`，可继续②攻击、③检测、矩阵评测与归档），
+  `meta.json` 额外记录 `embed_mode="auto"` 与 `auto_selection`
+  （请求参数、所选档位、逐档实测结果）。
+- **三档均未通过**：接口返回 `passed=false` 与逐档实测数据，
+  **不创建任务、不写任何文件**；页面在嵌入面板展示三档的 PSNR / 是否达标 /
+  恢复文本 / 一致性 / 置信度 / 失败原因，不会启用②攻击与矩阵面板。
+- **手动模式保持原行为**：`POST /api/embed` 的入参、响应与落盘格式完全不变，
+  自动模式是独立接口 `POST /api/embed-auto`。
+
+对应接口：`POST /api/embed-auto`（multipart：`image`、`text`、
+`jpeg_quality`、`crop_fraction`、`min_psnr_db`）。
 
 ### 独立检测的自动方向检索（可选）
 
@@ -270,7 +318,8 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | GET | `/` | 前端页面 |
 | GET | `/api/health` | 健康检查 |
-| POST | `/api/embed` | multipart：`image`(图片)、`text`、`strength`(low/medium/high)，返回任务 ID 与嵌入指标 |
+| POST | `/api/embed` | 手动模式 multipart：`image`(图片)、`text`、`strength`(low/medium/high)，返回任务 ID 与嵌入指标（行为不变） |
+| POST | `/api/embed-auto` | 自动选强度 multipart：`image`、`text`、`jpeg_quality`(20–100)、`crop_fraction`(0.30–1.00)、`min_psnr_db`(20–60)。按低→中→高从同一原图逐档嵌入，每档「先裁切后 JPEG」再调用现有盲检；返回 `passed`、所选档位与逐档 PSNR/恢复结果。通过时创建任务并沿用现有保存/下载流程；三档均不过时 `passed=false`、`job_id=null` 且**不创建任务、不写盘** |
 | POST | `/api/attack` | JSON：`{job_id, jpeg_quality?, crop_fraction?}`，生成受攻击待测图 |
 | POST | `/api/detect` | multipart：上传 `image` **或**传 `job_id`，返回文本、置信度、指标、检测记录 ID 与标注图 URL；独立上传可加 `auto_orient=true` 启用 8 方向自动检索（原向 / 90 / 180 / 270° + 水平镜像四方向），响应附带 `orientation_search`（入选方向、候选摘要、冲突），入选方向标注图已逆变换回上传图坐标 |
 | POST | `/api/jobs/{id}/robustness-matrix` | JSON：`{"jpeg_qualities": [90,50,30], "crop_fractions": [1.0,0.75,0.5]}`（各 1–3 个、不可重复；质量 20–100、比例 0.30–1.00）。**只读**：从同一份含水印原图为每格独立「先裁切后压缩」再调用现有检测器，逐格返回恢复文本 / 与原文是否一致 / 置信度与同步指标，并给出只按实测成功格计算的 `boundary`（二维最严成功边界，不做相邻推断）；不写 `target.png`、不改攻击历史、不产生检测记录与归档 |
@@ -332,6 +381,43 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
 > `conflict=true` 时 `conflict_texts` 列出有效候选恢复出的互不相同文本；
 > 此时顶层 `text` 只是置信度最高候选的结果，不应作为唯一结论。
 > 普通检测（不带 `auto_orient` 或 `false`）响应中 `orientation_search` 为 `null`。
+
+自动选强度响应（通过：`passed=true`，响应同时是一份完整的手动嵌入响应，
+`strength` 为所选档位、`job_id` 可直接用于攻击 / 检测 / 下载 / 矩阵）：
+
+```json
+{
+  "passed": true,
+  "mode": "auto",
+  "job_id": "9091b39c9140",
+  "id": "9091b39c9140",
+  "text": "机密-2026",
+  "strength": "medium",
+  "psnr_db": 35.58,
+  "selected_strength": "medium",
+  "request": { "jpeg_quality": 40, "crop_fraction": 0.5, "min_psnr_db": 30.0 },
+  "selected_tier": { "strength": "medium", "psnr_db": 35.58, "psnr_ok": true,
+                     "detected": true, "text": "机密-2026", "text_match": true,
+                     "metrics": { "confidence": 100.0 } },
+  "tiers": [
+    { "strength": "low",    "psnr_db": 38.34, "psnr_ok": true,
+      "detected": false, "text": "", "text_match": false,
+      "reason": "同步成功但文本校验失败…", "width": 192, "height": 192,
+      "snapped_fraction_w": 0.5, "snapped_fraction_h": 0.5, "metrics": { } },
+    { "strength": "medium", "psnr_db": 35.58, "psnr_ok": true,
+      "detected": true, "text": "机密-2026", "text_match": true,
+      "metrics": { "confidence": 100.0, "sync_score": 1.0 } },
+    { "strength": "high",   "psnr_db": 33.11, "psnr_ok": true,
+      "detected": true, "text": "机密-2026", "text_match": true,
+      "metrics": { "confidence": 100.0 } }
+  ]
+}
+```
+
+三档均未通过时仍返回 **200**，`passed=false`、`job_id=null`，`tiers`
+结构同上（含三档实测 PSNR、`psnr_ok`、恢复文本、`text_match` 与 `reason`），
+**服务端不创建任务目录、不写任何文件**；参数越界（质量 20–100、比例
+0.30–1.00、PSNR 20–60 之外）或类型错误返回 **400**，缺字段返回 **422**。
 
 鲁棒性矩阵响应（节选；`cells` 逐格、`boundary` 为实测成功格的二维最严边界）：
 
@@ -433,17 +519,19 @@ compose 默认把数据目录持久化到命名卷 `wm-data`；归档报告与�
 .
 ├── app/
 │   ├── dctwm.py          # 核心算法：DCT 嵌入 / PN 同步 / 相移搜索 / 多数表决 / 失真标注
+│   ├── autostrength.py   # 自动选强度：低→中→高从同一原图逐档「嵌入 + 先裁切后压缩 + 盲检」/ PSNR 达标判定（不落盘）
 │   ├── matrix.py         # 鲁棒性矩阵：质量×裁切逐格「先裁切后压缩」评测 / 实测成功格二维最严边界（只读、不落盘）
 │   ├── orientation.py    # 独立上传可选：8 方向（旋转 + 水平镜像）自动检索 / 载荷校验取舍 / 标注图逆变换
 │   ├── exifcheck.py      # 图片隐私检查：只读解析 EXIF 拍摄时间 / 相机 / GPS（损坏不阻断、不落盘）
 │   ├── archive.py        # 检测报告：规范化 JSON / SHA-256 清单 / 仅追加哈希链归档 / 校验
-│   ├── main.py           # FastAPI：任务存储、嵌入/攻击/检测/鲁棒性矩阵/隐私检查/报告接口、静态资源
+│   ├── main.py           # FastAPI：任务存储、手动/自动嵌入、攻击/检测/鲁棒性矩阵/隐私检查/报告接口、静态资源
 │   └── static/
-│       ├── index.html    # 单页界面（嵌入 / 攻击 / 鲁棒性矩阵 / 检测 / 隐私检查 / 归档 六区）
+│       ├── index.html    # 单页界面（嵌入含手动/自动选强度 / 攻击 / 鲁棒性矩阵 / 检测 / 隐私检查 / 归档 七区）
 │       ├── style.css
 │       └── app.js
 ├── tests/
 │   ├── test_core.py      # 核心算法数值验证（DCT/PN/鲁棒性全链路）
+│   ├── test_autostrength.py # 自动选强度：参数校验 / 低中高顺序与逐字一致+PSNR 双条件 / 三档失败不建任务 / 接口
 │   ├── test_matrix.py    # 鲁棒性矩阵：边界偏序（严格支配/不推断缺口）/ 参数校验 / 只读不改写 / 接口
 │   ├── test_orientation.py # 自动方向检索：8 向枚举 / 同分取舍 / 冲突 / 逆变换 / 归档
 │   ├── test_privacy.py   # 隐私检查接口：EXIF 解析 / DMS 还原 / 缺失与损坏 / 不落盘不阻断
@@ -465,7 +553,7 @@ python3 -m pytest tests/ -q   # 归档 + 隐私检查 + 方向检索接口测试
 
 ```
 <job_id>/
-├── meta.json                         # 嵌入参数（独立上传检测时为 upload_only 轻量元数据）
+├── meta.json                         # 嵌入参数（自动选强度时另含 embed_mode/auto_selection；独立上传检测时为 upload_only 轻量元数据）
 ├── original.png / watermarked.png / target.png / marked.png
 └── detections/
     ├── det_xxxxxxxxxxxx.json         # 检测记录（文本/置信度/指标/攻击参数；自动方向检索时含 orientation_search 方向与候选摘要）

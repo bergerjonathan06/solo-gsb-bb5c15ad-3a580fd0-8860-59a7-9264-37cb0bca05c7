@@ -2,7 +2,10 @@
 
 接口：
   GET  /                 前端页面
-  POST /api/embed        上传图片 + 文本 -> 含水印 PNG
+  POST /api/embed        手动模式：上传图片 + 文本 + 指定强度 -> 含水印 PNG
+  POST /api/embed-auto   自动选强度：按低/中/高逐档试嵌，每档先裁切后 JPEG
+                          压缩并盲检，取首个「恢复文本逐字一致且 PSNR 达标」档
+                          保存为任务；三档均不过则不建任务、返回逐档实测结果
   POST /api/attack       对任务图片施加 JPEG 重压缩 / 中心裁切
   POST /api/detect       上传图片或引用任务图片 -> 水印检测结果 + 失真叠加图；
                           独立上传可选 auto_orient=true 做 8 方向自动检索
@@ -34,7 +37,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
 
-from . import archive, dctwm as wm
+from . import archive, autostrength, dctwm as wm
 from . import exifcheck, matrix, orientation
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -45,7 +48,7 @@ MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 MAX_DIM = 4096
 ALLOWED_KINDS = {"original", "watermarked", "target", "marked"}
 
-app = FastAPI(title="抗裁切水印实验台", version="1.3.0")
+app = FastAPI(title="抗裁切水印实验台", version="1.4.0")
 
 
 # ---------------------------------------------------------------- 任务存储
@@ -130,6 +133,56 @@ def _check_dimensions(rgb: np.ndarray) -> np.ndarray:
     return rgb
 
 
+async def _read_embed_upload(image: UploadFile) -> np.ndarray:
+    """读取并校验嵌入接口上传的原图，返回 RGB 数组。"""
+    data = await image.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="图片不能超过 16MB。")
+    if not data:
+        raise HTTPException(status_code=400, detail="上传内容为空。")
+    try:
+        pil = exifcheck.open_rgb_transposed(data)
+    except exifcheck.PrivacyCheckError:
+        raise HTTPException(status_code=400, detail="无法解析上传的图片。")
+    return _check_dimensions(np.array(pil))
+
+
+def _embed_meta(
+    job_id: str, rgb: np.ndarray, text: str, res: wm.EmbedResult,
+    extra: dict | None = None,
+) -> dict:
+    meta = {
+        "id": job_id,
+        "created_at": time.time(),
+        "text": text,
+        "strength": res.strength,
+        "width": int(rgb.shape[1]),
+        "height": int(rgb.shape[0]),
+        "psnr_db": res.psnr_db,
+        "full_tiles": res.full_tiles,
+        "payload_bytes": res.payload_bytes,
+        "capacity_bytes": res.capacity_bytes,
+        "votes_per_bit": res.votes_per_bit,
+    }
+    if extra:
+        meta.update(extra)
+    return meta
+
+
+def _persist_embed_job(
+    rgb: np.ndarray, text: str, res: wm.EmbedResult, extra_meta: dict | None = None,
+) -> dict:
+    """创建任务目录、保存原图/含水印 PNG 与 meta（手动/自动嵌入共用）。"""
+    job_id = uuid.uuid4().hex[:12]
+    d = _job_dir(job_id)
+    Image.fromarray(rgb).save(d / "original.png", format="PNG", optimize=True)
+    Image.fromarray(res.image).save(d / "watermarked.png", format="PNG", optimize=True)
+    meta = _embed_meta(job_id, rgb, text, res, extra_meta)
+    _save_meta(job_id, meta)
+    _prune_jobs()
+    return meta
+
+
 # ---------------------------------------------------------------- 请求模型
 
 class AttackRequest(BaseModel):
@@ -177,44 +230,93 @@ async def embed(
     text: str = Form(...),
     strength: str = Form("medium"),
 ):
+    """手动选强度嵌入（行为保持不变）。"""
     _ensure_data_dir()
     text = text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="水印文本不能为空。")
-    data = await image.read(MAX_UPLOAD_BYTES + 1)
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="图片不能超过 16MB。")
-    try:
-        pil = exifcheck.open_rgb_transposed(data)
-    except exifcheck.PrivacyCheckError:
-        raise HTTPException(status_code=400, detail="无法解析上传的图片。")
-    rgb = _check_dimensions(np.array(pil))
+    rgb = await _read_embed_upload(image)
 
     try:
         res = wm.embed_watermark(rgb, text, strength=strength)
     except wm.WatermarkError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    job_id = uuid.uuid4().hex[:12]
-    d = _job_dir(job_id)
-    Image.fromarray(rgb).save(d / "original.png", format="PNG", optimize=True)
-    Image.fromarray(res.image).save(d / "watermarked.png", format="PNG", optimize=True)
-    meta = {
-        "id": job_id,
-        "created_at": time.time(),
-        "text": text,
-        "strength": strength,
-        "width": int(rgb.shape[1]),
-        "height": int(rgb.shape[0]),
-        "psnr_db": res.psnr_db,
-        "full_tiles": res.full_tiles,
-        "payload_bytes": res.payload_bytes,
-        "capacity_bytes": res.capacity_bytes,
-        "votes_per_bit": res.votes_per_bit,
+    meta = _persist_embed_job(rgb, text, res)
+    return {"job_id": meta["id"], **meta}
+
+
+@app.post("/api/embed-auto")
+async def embed_auto(
+    image: UploadFile = File(...),
+    text: str = Form(...),
+    jpeg_quality: int = Form(...),
+    crop_fraction: float = Form(...),
+    min_psnr_db: float = Form(...),
+):
+    """自动选强度嵌入。
+
+    服务端按低、中、高顺序从**同一原图**分别嵌入；每档都执行
+    「先中心裁切、后 JPEG 压缩」并调用现有盲检，仅当恢复文本与原文
+    逐字一致、且嵌入图 PSNR 不低于用户下限时该档通过，取**首个**
+    通过档。通过则沿用现有任务保存/下载流程；三档均未通过时
+    **不创建任务**，仅返回逐档实测结果（HTTP 200 + passed=false）。
+    """
+    _ensure_data_dir()
+    text = text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="水印文本不能为空。")
+    rgb = await _read_embed_upload(image)
+
+    try:
+        chosen, tiers = autostrength.evaluate_tiers(
+            rgb, text, jpeg_quality, crop_fraction, min_psnr_db)
+    except autostrength.AutoStrengthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except wm.WatermarkError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    tier_dicts = [tr.as_dict() for tr in tiers]
+    request_params = {
+        "jpeg_quality": int(jpeg_quality),
+        "crop_fraction": round(float(crop_fraction), 3),
+        "min_psnr_db": float(min_psnr_db),
     }
-    _save_meta(job_id, meta)
-    _prune_jobs()
-    return {"job_id": job_id, **meta}
+
+    if chosen is None:
+        # 三档均未通过：不创建任务、不写盘，仅返回逐档实测结果。
+        return JSONResponse({
+            "passed": False,
+            "mode": "auto",
+            "text": text,
+            "width": int(rgb.shape[1]),
+            "height": int(rgb.shape[0]),
+            "job_id": None,
+            "selected_strength": None,
+            "request": request_params,
+            "tiers": tier_dicts,
+        })
+
+    chosen_tier = next(tr for tr in tiers if tr.strength == chosen)
+    auto_meta = {
+        "embed_mode": "auto",
+        "auto_selection": {
+            "selected_strength": chosen,
+            "request": request_params,
+            "tiers": tier_dicts,
+        },
+    }
+    meta = _persist_embed_job(rgb, text, chosen_tier.embed, auto_meta)
+    return JSONResponse({
+        "passed": True,
+        "mode": "auto",
+        "request": request_params,
+        "selected_strength": chosen,
+        "selected_tier": next(d for d in tier_dicts if d["strength"] == chosen),
+        "tiers": tier_dicts,
+        "job_id": meta["id"],
+        **meta,
+    })
 
 
 @app.post("/api/attack")
