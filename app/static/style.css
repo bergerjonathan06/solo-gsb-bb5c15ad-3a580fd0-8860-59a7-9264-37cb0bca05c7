@@ -369,6 +369,39 @@ button.primary.subtle { margin-top: 12px; background: linear-gradient(135deg, #2
 input[type="range"] { width: 100%; accent-color: var(--accent); }
 .range-labels { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
 
+/* ---------- 自动选强度嵌入 ---------- */
+.auto-note { margin: 0 0 14px; font-size: 12px; line-height: 1.65; }
+.auto-box { margin-top: 12px; }
+.auto-verdict { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.auto-verdict.ok { color: var(--accent-2); }
+.auto-verdict.fail { color: #ff8b8b; }
+.auto-params { font-size: 12px; margin-bottom: 8px; }
+.auto-table th { white-space: nowrap; }
+.auto-table tbody td {
+  font-size: 12px;
+  padding: 7px 9px;
+  text-align: left;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: rgba(235, 70, 70, 0.10);
+  border-color: rgba(235, 70, 70, 0.35);
+  color: #d7dee9;
+  vertical-align: middle;
+}
+.auto-table tbody tr.ok td {
+  background: rgba(53, 208, 163, 0.13);
+  border-color: rgba(53, 208, 163, 0.45);
+}
+.auto-table tbody tr.selected td {
+  border-width: 2px;
+  border-color: #6ea4ff;
+  box-shadow: 0 0 0 1px rgba(110, 164, 255, 0.35) inset,
+              0 0 10px rgba(79, 140, 255, 0.22);
+  color: #8feccf;
+  font-weight: 600;
+}
+.auto-table td.auto-text { word-break: break-all; font-variant-numeric: tabular-nums; }
+
 /* ---------- 鲁棒性矩阵评测 ---------- */
 .matrix-inputs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .matrix-inputs input {

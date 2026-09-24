@@ -2,7 +2,10 @@
 
 接口：
   GET  /                 前端页面
-  POST /api/embed        上传图片 + 文本 -> 含水印 PNG
+  POST /api/embed        上传图片 + 文本 -> 含水印 PNG（手动指定强度）
+  POST /api/embed-auto   自动选强度：低/中/高逐档嵌入并「先裁切后 JPEG」盲检，
+                          首个恢复逐字一致且 PSNR 达标的档位通过；三档均未通过时
+                          返回逐档实测结果且不创建任务，通过时沿用现有任务/下载流程
   POST /api/attack       对任务图片施加 JPEG 重压缩 / 中心裁切
   POST /api/detect       上传图片或引用任务图片 -> 水印检测结果 + 失真叠加图；
                           独立上传可选 auto_orient=true 做 8 方向自动检索
@@ -35,7 +38,7 @@ from PIL import Image
 from pydantic import BaseModel
 
 from . import archive, dctwm as wm
-from . import exifcheck, matrix, orientation
+from . import autoembed, exifcheck, matrix, orientation
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -45,7 +48,7 @@ MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 MAX_DIM = 4096
 ALLOWED_KINDS = {"original", "watermarked", "target", "marked"}
 
-app = FastAPI(title="抗裁切水印实验台", version="1.3.0")
+app = FastAPI(title="抗裁切水印实验台", version="1.4.0")
 
 
 # ---------------------------------------------------------------- 任务存储
@@ -204,6 +207,7 @@ async def embed(
         "created_at": time.time(),
         "text": text,
         "strength": strength,
+        "embed_mode": "manual",
         "width": int(rgb.shape[1]),
         "height": int(rgb.shape[0]),
         "psnr_db": res.psnr_db,
@@ -211,6 +215,74 @@ async def embed(
         "payload_bytes": res.payload_bytes,
         "capacity_bytes": res.capacity_bytes,
         "votes_per_bit": res.votes_per_bit,
+    }
+    _save_meta(job_id, meta)
+    _prune_jobs()
+    return {"job_id": job_id, **meta}
+
+
+@app.post("/api/embed-auto")
+async def embed_auto(
+    image: UploadFile = File(...),
+    text: str = Form(...),
+    jpeg_quality: int = Form(...),
+    crop_percent: float = Form(...),
+    min_psnr: float = Form(...),
+):
+    """自动选强度嵌入（低→中→高逐档嵌入 + 模拟传播失真盲检）。
+
+    服务端从同一份原图按 low/medium/high 分别嵌入，每档先中心裁切再
+    JPEG 压缩后调用现有盲检；仅当恢复文本与原文逐字一致且嵌入图 PSNR
+    不低于用户门槛时该档通过，取顺序上首个通过档。
+
+    三档均未通过时返回 200 + ``job_id=null`` 与逐档实测结果，不创建任务；
+    通过时沿用 /api/embed 的任务保存（original/watermarked PNG、meta.json）
+    与下载流程，并在 meta 中记录所选档位与全部逐档实测结果。
+    """
+    _ensure_data_dir()
+    text = text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="水印文本不能为空。")
+    data = await image.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="图片不能超过 16MB。")
+    try:
+        pil = exifcheck.open_rgb_transposed(data)
+    except exifcheck.PrivacyCheckError:
+        raise HTTPException(status_code=400, detail="无法解析上传的图片。")
+    rgb = _check_dimensions(np.array(pil))
+
+    try:
+        evaluation, selected = autoembed.run_auto_embed(
+            rgb, text, jpeg_quality, crop_percent, min_psnr)
+    except autoembed.AutoEmbedError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except wm.WatermarkError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if selected is None:
+        # 三档均未通过：只返回逐档实测结果，不创建任何任务文件
+        return JSONResponse({"job_id": None, **evaluation})
+
+    job_id = uuid.uuid4().hex[:12]
+    d = _job_dir(job_id)
+    Image.fromarray(rgb).save(d / "original.png", format="PNG", optimize=True)
+    Image.fromarray(selected.image).save(
+        d / "watermarked.png", format="PNG", optimize=True)
+    meta = {
+        "id": job_id,
+        "created_at": time.time(),
+        "text": text,
+        "strength": selected.strength,
+        "embed_mode": "auto",
+        "width": int(rgb.shape[1]),
+        "height": int(rgb.shape[0]),
+        "psnr_db": selected.psnr_db,
+        "full_tiles": selected.full_tiles,
+        "payload_bytes": selected.payload_bytes,
+        "capacity_bytes": selected.capacity_bytes,
+        "votes_per_bit": selected.votes_per_bit,
+        "auto_select": evaluation,
     }
     _save_meta(job_id, meta)
     _prune_jobs()

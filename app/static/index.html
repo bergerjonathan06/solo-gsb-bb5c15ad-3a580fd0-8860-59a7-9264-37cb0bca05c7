@@ -41,6 +41,14 @@
       </label>
 
       <div class="field">
+        <span>嵌入模式</span>
+        <div class="seg" id="embed-mode-seg">
+          <button type="button" data-value="manual" class="on">手动强度</button>
+          <button type="button" data-value="auto">自动选强度</button>
+        </div>
+      </div>
+
+      <div class="field" id="strength-field">
         <span>嵌入强度</span>
         <div class="seg" id="strength-seg">
           <button type="button" data-value="low">低（更隐蔽）</button>
@@ -49,12 +57,51 @@
         </div>
       </div>
 
+      <div id="auto-embed-fields" class="hidden">
+        <p class="muted auto-note">
+          服务端按 <b>低 → 中 → 高</b> 顺序从同一原图分别嵌入，每档先做中心裁切、
+          再 JPEG 压缩后调用现有盲检；只有<b>恢复文本逐字一致</b>且
+          <b>嵌入图 PSNR 达标</b>的首个档位被选中。三档均不通过时不会创建任务。
+        </p>
+
+        <div class="field">
+          <span>模拟 JPEG 重压缩质量：<b id="auto-jpeg-val">50</b></span>
+          <input type="range" id="auto-jpeg-q" min="20" max="100" value="50" />
+          <div class="range-labels"><span>20（狠）</span><span>50</span><span>100（轻）</span></div>
+        </div>
+
+        <div class="field">
+          <span>模拟中心裁切保留比例：<b id="auto-crop-val">75%</b></span>
+          <input type="range" id="auto-crop-f" min="30" max="100" value="75" step="5" />
+          <div class="range-labels"><span>30%</span><span>75%</span><span>100%</span></div>
+        </div>
+
+        <div class="field">
+          <span>最低可接受 PSNR：<b id="auto-psnr-val">30 dB</b></span>
+          <input type="range" id="auto-psnr" min="20" max="60" value="30" />
+          <div class="range-labels"><span>20 dB</span><span>30 dB</span><span>60 dB</span></div>
+        </div>
+      </div>
+
       <button class="primary" id="btn-embed">嵌入水印</button>
       <div class="status" id="embed-status"></div>
+
+      <div id="auto-embed-result" class="matrix-box auto-box hidden">
+        <div id="auto-verdict" class="auto-verdict"></div>
+        <div id="auto-params" class="auto-params muted"></div>
+        <div class="matrix-table-wrap">
+          <table class="matrix-table auto-table" id="auto-tier-table"></table>
+        </div>
+        <small class="muted">
+          每档均从同一原图独立嵌入并做「先裁切后 JPEG」盲检；
+          通过条件 = 恢复文本与原文逐字一致 且 嵌入图 PSNR ≥ 最低要求，悬停查看详情。
+        </small>
+      </div>
 
       <div id="embed-meta" class="meta hidden">
         <h3>嵌入结果</h3>
         <dl>
+          <dt>强度档位</dt><dd id="m-strength">—</dd>
           <dt>PSNR</dt><dd id="m-psnr">—</dd>
           <dt>同步瓦片</dt><dd id="m-tiles">—</dd>
           <dt>每比特票数</dt><dd id="m-votes">—</dd>

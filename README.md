@@ -13,7 +13,7 @@
 
 ## 一、快速启动
 
-### 方式 A：docker compose（推荐）
+### 方式 A：docker compose（推荐，一条命令）
 
 ```bash
 docker compose up -d --build
@@ -32,6 +32,15 @@ docker compose up -d --build
 docker compose down            # 停止
 docker compose down -v         # 停止并删除任务数据卷
 ```
+
+> 不使用 compose 时，仅用 Dockerfile 也可以一条命令启动（数据保存在命名卷
+> `wm-data` 中，端口同样是 8000）：
+>
+> ```bash
+> docker build -t wm-bench . && docker run -d --name wm-bench -p 8000:8000 -v wm-data:/data/wmbench wm-bench
+> ```
+>
+> 然后访问 **http://localhost:8000** 。
 
 ### 方式 B：本地 Python 运行
 
@@ -52,8 +61,13 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
 页面按 **① 嵌入 → ② 施加攻击 → ③ 检测 / 标注** 三步组织：
 
 1. **嵌入水印**：选择本地图片（最短边 ≥ 128px，建议 ≥ 512px 的自然照片），
-   输入短文本（≤ 45 字节，约 45 个 ASCII 字符或 15 个汉字），选择强度后点击「嵌入水印」。
-   页面显示 PSNR、同步瓦片数、每比特票数等指标，并可**下载无损含水印 PNG**。
+   输入短文本（≤ 45 字节，约 45 个 ASCII 字符或 15 个汉字）。嵌入模式二选一：
+   - **手动强度**：直接指定 低 / 中 / 高 档位（行为与旧版完全一致）；
+   - **自动选强度**：再指定 **JPEG 质量（20–100）**、**中心裁切保留比例
+     （30%–100%）** 与 **最低 PSNR（20–60 dB）**，由服务端逐档实测选档（见下节）。
+
+   嵌入成功后页面显示所选强度档位、PSNR、同步瓦片数、每比特票数等指标，并可
+   **下载无损含水印 PNG**。
 2. **施加攻击**：拖动滑块选择 JPEG 质量（20–100）与中心裁切保留比例（30%–100%，
    裁切边界吸附到 8px DCT 网格），可多次叠加。点击「检测受攻击图片」。
 3. **检测 / 标注**：
@@ -63,6 +77,37 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
    - 「失真标注图」用颜色标出健康/受损瓦片、判决错误块、可疑弱块，可**下载 PNG**。
 
 此外，「独立检测」区支持直接上传任意图片（含水印图、JPEG 转发件、截图等）进行盲检测。
+
+### 自动选强度嵌入（低→中→高逐档实测，选首个达标档）
+
+① 嵌入面板把「嵌入模式」切到 **「自动选强度」**，除原图与文本外再设置三项门槛：
+
+- **模拟 JPEG 质量**（20–100）：对每档嵌入图做重压缩的质量；
+- **模拟中心裁切保留比例**（30%–100%，边界吸附 8px 网格）；
+- **最低 PSNR**（20–60 dB）：嵌入图相对原图的不可见性下限。
+
+点击「自动选强度并嵌入」后，服务端从**同一份原图**按 **低 → 中 → 高** 顺序：
+
+1. 以该档强度嵌入水印（记录嵌入图 **PSNR**）；
+2. 对嵌入图 **先中心裁切、再 JPEG 压缩**（与鲁棒性矩阵完全相同的攻击顺序）；
+3. 调用与③完全相同的**现有盲检**恢复文本。
+
+**通过条件 = 恢复文本与原文逐字一致 且 嵌入图 PSNR ≥ 最低要求**；
+选择顺序上**首个通过档**为最终档位（低 PSNR 最高、最隐蔽，故低档能过就不升级）。
+
+- **有档位通过**：沿用现有任务保存与下载流程——写入
+  `original.png / watermarked.png（所选档位）/ meta.json`，②攻击、③检测、
+  矩阵评测、报告归档等后续流程与手动嵌入完全一致；`meta.json` 中
+  `embed_mode="auto"` 并保存 `auto_select` 逐档实测记录。
+- **三档均未通过**：返回**逐档实测结果**（每档 PSNR、PSNR 是否达标、模拟攻击后
+  恢复文本、是否与原文一致、置信度 / 同步指标、未通过原因），页面逐档展示并提示
+  **不创建任务**；可放宽条件（降低 PSNR 门槛 / 提高 JPEG 质量 / 提高裁切保留比例）
+  后重试，或切回手动强度。
+
+对应接口：`POST /api/embed-auto`，multipart 字段
+`image`、`text`、`jpeg_quality`(20–100 整数)、`crop_percent`(30–100)、
+`min_psnr`(20–60 dB)。参数越界返回 **400**，字段缺失 / 类型错误返回 **422**；
+三档均未通过时 HTTP 仍为 **200**，但 `job_id=null`、`passed=false`。
 
 ### 鲁棒性矩阵评测（只读批量，不改写任务）
 
@@ -270,7 +315,8 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | GET | `/` | 前端页面 |
 | GET | `/api/health` | 健康检查 |
-| POST | `/api/embed` | multipart：`image`(图片)、`text`、`strength`(low/medium/high)，返回任务 ID 与嵌入指标 |
+| POST | `/api/embed` | multipart：`image`(图片)、`text`、`strength`(low/medium/high)，返回任务 ID 与嵌入指标（手动模式，`embed_mode="manual"`） |
+| POST | `/api/embed-auto` | multipart：`image`、`text`、`jpeg_quality`(20–100)、`crop_percent`(30–100)、`min_psnr`(20–60 dB)。自动选强度：低→中→高逐档嵌入并「先裁切后 JPEG」盲检，选首个恢复逐字一致且 PSNR 达标档；通过时建任务（`embed_mode="auto"`，含 `auto_select` 逐档实测），三档均未通过时 `job_id=null` 且不建任务 |
 | POST | `/api/attack` | JSON：`{job_id, jpeg_quality?, crop_fraction?}`，生成受攻击待测图 |
 | POST | `/api/detect` | multipart：上传 `image` **或**传 `job_id`，返回文本、置信度、指标、检测记录 ID 与标注图 URL；独立上传可加 `auto_orient=true` 启用 8 方向自动检索（原向 / 90 / 180 / 270° + 水平镜像四方向），响应附带 `orientation_search`（入选方向、候选摘要、冲突），入选方向标注图已逆变换回上传图坐标 |
 | POST | `/api/jobs/{id}/robustness-matrix` | JSON：`{"jpeg_qualities": [90,50,30], "crop_fractions": [1.0,0.75,0.5]}`（各 1–3 个、不可重复；质量 20–100、比例 0.30–1.00）。**只读**：从同一份含水印原图为每格独立「先裁切后压缩」再调用现有检测器，逐格返回恢复文本 / 与原文是否一致 / 置信度与同步指标，并给出只按实测成功格计算的 `boundary`（二维最严成功边界，不做相邻推断）；不写 `target.png`、不改攻击历史、不产生检测记录与归档 |
@@ -302,6 +348,42 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
   "marked_url": "/api/jobs/.../marked"
 }
 ```
+
+自动选强度嵌入响应（节选；通过时 `job_id` 非空，未通过时 `job_id=null` 且不建任务）：
+
+```json
+{
+  "job_id": "756b2203d38f",
+  "strength": "medium",
+  "embed_mode": "auto",
+  "psnr_db": 35.6,
+  "auto_select": {
+    "passed": true,
+    "selected_strength": "medium",
+    "params": { "jpeg_quality": 35, "crop_fraction": 1.0,
+                "crop_percent": 100.0, "min_psnr_db": 30.0 },
+    "tiers": [
+      { "strength": "low", "psnr_db": 38.4, "psnr_ok": true,
+        "detected": false, "recovered_text": "", "text_match": false,
+        "reason": "同步成功但文本校验失败（码流可能被 JPEG/裁切破坏）。",
+        "passed": false, "selected": false,
+        "metrics": { "confidence": 0.0, "sync_score": 0.91 } },
+      { "strength": "medium", "psnr_db": 35.6, "psnr_ok": true,
+        "detected": true, "recovered_text": "机密-自动-2026",
+        "text_match": true, "passed": true, "selected": true,
+        "metrics": { "confidence": 100.0, "sync_score": 1.0 } },
+      { "strength": "high", "psnr_db": 33.1, "psnr_ok": true,
+        "detected": true, "recovered_text": "机密-自动-2026",
+        "text_match": true, "passed": true, "selected": false,
+        "metrics": { "confidence": 100.0, "sync_score": 1.0 } }
+    ]
+  }
+}
+```
+
+> 三档全部实测并逐档返回（页面据此展示各档 PSNR 与恢复结果）；`selected`
+> 只标记顺序上首个通过档。三档均未通过时响应顶层即评测结果
+> （`passed=false`、`tiers=[...]`、`job_id=null`），服务端不创建任何任务文件。
 
 启用自动方向检索时（`auto_orient=true`），检测响应与检测记录额外包含
 `orientation_search`：
@@ -433,17 +515,19 @@ compose 默认把数据目录持久化到命名卷 `wm-data`；归档报告与�
 .
 ├── app/
 │   ├── dctwm.py          # 核心算法：DCT 嵌入 / PN 同步 / 相移搜索 / 多数表决 / 失真标注
+│   ├── autoembed.py      # 自动选强度：低→中→高逐档嵌入 + 先裁切后 JPEG 盲检，选首个达标档（只读评测）
 │   ├── matrix.py         # 鲁棒性矩阵：质量×裁切逐格「先裁切后压缩」评测 / 实测成功格二维最严边界（只读、不落盘）
 │   ├── orientation.py    # 独立上传可选：8 方向（旋转 + 水平镜像）自动检索 / 载荷校验取舍 / 标注图逆变换
 │   ├── exifcheck.py      # 图片隐私检查：只读解析 EXIF 拍摄时间 / 相机 / GPS（损坏不阻断、不落盘）
 │   ├── archive.py        # 检测报告：规范化 JSON / SHA-256 清单 / 仅追加哈希链归档 / 校验
-│   ├── main.py           # FastAPI：任务存储、嵌入/攻击/检测/鲁棒性矩阵/隐私检查/报告接口、静态资源
+│   ├── main.py           # FastAPI：任务存储、嵌入（手动/自动）/攻击/检测/鲁棒性矩阵/隐私检查/报告接口、静态资源
 │   └── static/
-│       ├── index.html    # 单页界面（嵌入 / 攻击 / 鲁棒性矩阵 / 检测 / 隐私检查 / 归档 六区）
+│       ├── index.html    # 单页界面（嵌入[手动/自动] / 攻击 / 鲁棒性矩阵 / 检测 / 隐私检查 / 归档 六区）
 │       ├── style.css
 │       └── app.js
 ├── tests/
 │   ├── test_core.py      # 核心算法数值验证（DCT/PN/鲁棒性全链路）
+│   ├── test_autoembed.py # 自动选强度：参数校验 / 逐档实测选择 / 失败不建任务 / 通过后沿用现有流程
 │   ├── test_matrix.py    # 鲁棒性矩阵：边界偏序（严格支配/不推断缺口）/ 参数校验 / 只读不改写 / 接口
 │   ├── test_orientation.py # 自动方向检索：8 向枚举 / 同分取舍 / 冲突 / 逆变换 / 归档
 │   ├── test_privacy.py   # 隐私检查接口：EXIF 解析 / DMS 还原 / 缺失与损坏 / 不落盘不阻断
@@ -458,7 +542,7 @@ compose 默认把数据目录持久化到命名卷 `wm-data`；归档报告与�
 
 ```bash
 python3 tests/test_core.py
-python3 -m pytest tests/ -q   # 归档 + 隐私检查 + 方向检索接口测试
+python3 -m pytest tests/ -q   # 归档 + 隐私检查 + 方向检索 + 矩阵 + 自动选强度接口测试
 ```
 
 数据目录布局（`WM_DATA_DIR`）：
